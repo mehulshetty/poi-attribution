@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from scipy.spatial import cKDTree
 from pyproj import Proj
+import math
 import torch
 from torch.utils.data import Dataset
 
@@ -11,32 +12,38 @@ PAD = 0
 K = 5
 DISTANCE_THRESHOLD = 100
 
-def split_indices_for_next_prediction(df):
-    grouped = df.groupby('agent').cumcount()
-    total_len = len(df)
-    train_end = int(total_len * 0.7)
-    val_end = int(total_len * 0.85)
-
-    train_indices = pd.DataFrame({'first_idx': range(0, train_end), 'last_idx': range(0, train_end)}).iloc[::RAW_SEQ_LEN]
-    val_indices = pd.DataFrame({'first_idx': range(train_end, val_end), 'last_index': range(train_end, val_end)}).iloc[::RAW_SEQ_LEN]
-    test_indices = pd.DataFrame({'first_idx': range(val_end, total_len), 'last_idx': range(val_end, total_len)}).iloc[::RAW_SEQ_LEN]
-
-    return train_indices, val_indices, test_indices
-
 # 1. Load the Data
 poi_cat_vecs_df = pd.read_parquet("/Users/mehul/Downloads/novateur.phase2.trial4/poi_cat_vecs.parquet")
 poi_df = pd.read_csv("/Users/mehul/Downloads/novateur.phase2.trial4/poi.csv")
 stay_poi_df = pd.read_parquet("/Users/mehul/Downloads/novateur.phase2.trial4/stay_poi_dfs/group=0/stay_poi.parquet")
 
 # 2. Project Coordinates to UTM
-def project_to_utm(df, lat_col = 'latitude', lon_col = 'longitude'):
-    zone_number = int((df[lon_col].mean() + 180) // 6) + 1
-    utm_proj = Proj(proj='utm', zone=zone_number, ellps='WGS84')
-    df['x'], df['y'] = utm_proj(df[lon_col].values, df[lat_col].values)
-    return df
 
-stay_poi_df = project_to_utm(stay_poi_df, lat_col='latitude', lon_col='longitude')
-poi_df = project_to_utm(poi_df, lat_col='latitude', lon_col='longitude')
+### Borrowed from TrajGPT ###
+def get_utm_zone(longitude):
+    return int((math.floor((longitude + 180) / 6) % 60) + 1)
+
+
+def project_latlon_to_xy(df):
+    # Get centroid
+    lat_c, lon_c = df[['latitude', 'longitude']].mean().values
+
+    # Initialize UTM projection
+    zone_number = get_utm_zone(lon_c)
+    project_utm = Proj(proj='utm', zone=zone_number, ellps='WGS84')
+
+    # Project centroid to UTM
+    utm_x_c, utm_y_c = project_utm(lon_c, lat_c)
+
+    utm_x, utm_y = project_utm(df['longitude'], df['latitude'])
+    x = utm_x - utm_x_c  # Unit: meter
+    y = utm_y - utm_y_c  # Unit: meter
+    return x, y
+
+### 
+
+stay_poi_df['x'], stay_poi_df['y'] = project_latlon_to_xy(stay_poi_df)
+poi_df['x'], poi_df['y'] = project_latlon_to_xy(poi_df)
 
 # 3. Calculate Duration (in Hours)
 stay_poi_df['start_timestamp'] = pd.to_datetime(stay_poi_df['start_timestamp'])
@@ -79,6 +86,45 @@ max_travel_time = stay_poi_df['travel_time'].quantile(0.99) * 24  # Convert to h
 stay_poi_df.loc[stay_poi_df['travel_time'] * 24 > max_travel_time, 'travel_time'] = max_travel_time / 24
 
 # 8. Sort and split into sequences
+
+### Borrowed from TrajGPT ###
+def split_indices_for_next_prediction(df):
+    # Identify instances for next visit prediction
+    groupby_user = df.groupby('agent')
+
+    # Find the first index of each instance
+    # 1. First instance of each user
+    user_first_indices = groupby_user.nth(0).index
+    # 2. Instance with at least RAW_SEQ_LEN visits
+    max_num_visits_per_user = groupby_user.size().max()
+    long_enough_indices = groupby_user.nth(list(range(-max_num_visits_per_user, -RAW_SEQ_LEN))).index
+    # 3. Combine the two
+    first_indices = user_first_indices.union(long_enough_indices)
+
+    # Find the corresponding last indices
+    # 1. Last index of each user
+    each_user_last_index = groupby_user.nth(-1).set_index('agent')['id']
+    # 2. Match it with first_indices
+    user_last_indices = df.loc[first_indices]['agent'].apply(lambda user_id: each_user_last_index.loc[user_id]).values
+    # 3. Last index of each rolling window
+    rolling_window_last_indices = (first_indices + RAW_SEQ_LEN - 1).values
+    last_indices = np.minimum(rolling_window_last_indices, user_last_indices)
+
+    # Sort instances by arrival_time
+    index_df = pd.DataFrame({'first_index': first_indices, 'last_index': last_indices, 'start_timestamp': df.loc[first_indices]['start_timestamp']})
+    index_df.sort_values(by='start_timestamp', inplace=True, ignore_index=True)
+    index_df.drop(columns=['start_timestamp'], inplace=True)
+
+    # Split instances into train, validation, and test sets
+    train_size = int(0.8 * len(index_df))
+    val_size = int(0.1 * len(index_df))
+    train_indices = index_df[:train_size].reset_index(drop=True)
+    val_indices = index_df[train_size: train_size + val_size].reset_index(drop=True)
+    test_indices = index_df[train_size + val_size:].reset_index(drop=True)
+
+    return train_indices, val_indices, test_indices
+###
+
 stay_poi_df.sort_values(by=['agent', 'start_timestamp'], inplace=True)
 train_indices, val_indices, test_indices = split_indices_for_next_prediction(stay_poi_df)
 
